@@ -226,6 +226,75 @@ impl X86Codegen {
                     asm.push(X86Instruction::Mov(dst, reg));
                 }
             }
+            IROp::And(src1, src2) => asm.push(X86Instruction::BinOp(
+                BinKind::And,
+                dst,
+                ctx.operand(src1, width),
+                ctx.operand(src2, width),
+            )),
+            IROp::Or(src1, src2) => asm.push(X86Instruction::BinOp(
+                BinKind::Or,
+                dst,
+                ctx.operand(src1, width),
+                ctx.operand(src2, width),
+            )),
+            IROp::Xor(src1, src2) => asm.push(X86Instruction::BinOp(
+                BinKind::Xor,
+                dst,
+                ctx.operand(src1, width),
+                ctx.operand(src2, width),
+            )),
+            IROp::Shl(src, cnt) | IROp::AShr(src, cnt) | IROp::LShr(src, cnt) => {
+                let kind = match inst.op {
+                    IROp::Shl(..) => ShiftKind::Shl,
+                    IROp::AShr(..) => ShiftKind::Sar,
+                    _ => ShiftKind::Shr,
+                };
+
+                let cnt = match ctx.consts.get(&cnt) {
+                    Some(&n) => Operand::Imm(n & 0x3f, Width::W8),
+                    None => {
+                        let cw = ctx.value_widths[&cnt];
+                        asm.push(X86Instruction::Mov(
+                            Operand::Reg(Reg::Physical(PhysReg::C, cw)),
+                            Operand::Reg(Reg::Virtual(cnt, cw)),
+                        ));
+                        Operand::Reg(Reg::Physical(PhysReg::C, Width::W8))
+                    }
+                };
+
+                asm.push(X86Instruction::Mov(dst, ctx.operand(src, width)));
+                asm.push(X86Instruction::Shift(kind, dst, cnt));
+            }
+            IROp::ZExt(src) => {
+                let sw = ctx.value_widths[&src];
+                if sw == Width::W32 {
+                    asm.push(X86Instruction::Mov(
+                        Operand::Reg(Reg::Virtual(dst_value, sw)),
+                        Operand::Reg(Reg::Virtual(src, sw)),
+                    ));
+                } else {
+                    asm.push(X86Instruction::Movzx(
+                        dst,
+                        Operand::Reg(Reg::Virtual(src, sw)),
+                    ));
+                }
+            }
+            IROp::SExt(src) => {
+                let sw = ctx.value_widths[&src];
+                asm.push(X86Instruction::Movsx(
+                    dst,
+                    Operand::Reg(Reg::Virtual(src, sw)),
+                ));
+            }
+            IROp::Trunc(src) => {
+                let sw = ctx.value_widths[&src];
+
+                asm.push(X86Instruction::Mov(
+                    dst,
+                    Operand::Reg(Reg::Virtual(src, sw)),
+                ));
+            }
             IROp::Jmp(ref label) => asm.push(X86Instruction::Jmp(format!(
                 "{}.{}",
                 ctx.func_name,
@@ -640,7 +709,11 @@ impl X86Codegen {
             for inst in &b.instructions {
                 match &inst.op {
                     IROp::Const(_) | IROp::Jmp(_) | IROp::Alloca(_) => {}
-                    IROp::Br(a, _, _) | IROp::Load(a, _) => *uses.entry(*a).or_default() += 1,
+                    IROp::Br(a, _, _)
+                    | IROp::Load(a, _)
+                    | IROp::ZExt(a)
+                    | IROp::SExt(a)
+                    | IROp::Trunc(a) => *uses.entry(*a).or_default() += 1,
                     IROp::Ret(a) => {
                         if let Some(a) = a {
                             *uses.entry(*a).or_default() += 1;
@@ -654,7 +727,13 @@ impl X86Codegen {
                     | IROp::URem(a, b)
                     | IROp::SRem(a, b)
                     | IROp::ICmp(_, a, b)
-                    | IROp::Store(a, _, b) => {
+                    | IROp::Store(a, _, b)
+                    | IROp::And(a, b)
+                    | IROp::Or(a, b)
+                    | IROp::Xor(a, b)
+                    | IROp::Shl(a, b)
+                    | IROp::AShr(a, b)
+                    | IROp::LShr(a, b) => {
                         *uses.entry(*a).or_default() += 1;
                         *uses.entry(*b).or_default() += 1;
                     }
@@ -771,6 +850,9 @@ impl X86Codegen {
                         BinKind::Add => X86Instruction::Add(d, s),
                         BinKind::Sub => X86Instruction::Sub(d, s),
                         BinKind::IMul => X86Instruction::IMul2(d, s),
+                        BinKind::And => X86Instruction::And(d, s),
+                        BinKind::Or => X86Instruction::Or(d, s),
+                        BinKind::Xor => X86Instruction::Xor(d, s),
                     };
 
                     if same(&dst, &a) {
@@ -1711,12 +1793,22 @@ pub enum BinKind {
     Add,
     Sub,
     IMul,
+    And,
+    Or,
+    Xor,
 }
 
 impl BinKind {
     fn commutative(self) -> bool {
         !matches!(self, BinKind::Sub)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShiftKind {
+    Shl,
+    Shr,
+    Sar,
 }
 
 #[derive(Debug, Clone)]
@@ -1734,7 +1826,10 @@ pub enum X86Instruction {
     Cwd,
     Cdq,
     Cqo,
+    And(Operand, Operand),
+    Or(Operand, Operand),
     Xor(Operand, Operand),
+    Shift(ShiftKind, Operand, Operand),
     Jmp(String),
     Ret,
     Label(String),
@@ -1758,6 +1853,9 @@ impl Display for X86Instruction {
         match self {
             Self::Mov(dst, src) => write!(f, "\tmov {dst}, {src}"),
             Self::Movzx(dst, src) => write!(f, "\tmovzx {dst}, {src}"),
+            Self::Movsx(dst, src) if src.width() == Width::W32 => {
+                write!(f, "\tmovsxd {dst}, {src}")
+            }
             Self::Movsx(dst, src) => write!(f, "\tmovsx {dst}, {src}"),
             Self::Add(dst, src) => write!(f, "\tadd {dst}, {src}"),
             Self::Sub(dst, src) => write!(f, "\tsub {dst}, {src}"),
@@ -1769,7 +1867,18 @@ impl Display for X86Instruction {
             Self::Cwd => write!(f, "\tcwd"),
             Self::Cdq => write!(f, "\tcdq"),
             Self::Cqo => write!(f, "\tcqo"),
+            Self::And(dst, src) => write!(f, "\tand {dst}, {src}"),
+            Self::Or(dst, src) => write!(f, "\tor {dst}, {src}"),
             Self::Xor(dst, src) => write!(f, "\txor {dst}, {src}"),
+            Self::Shift(kind, dst, src) => write!(
+                f,
+                "\t{} {dst}, {src}",
+                match kind {
+                    ShiftKind::Shl => "shl",
+                    ShiftKind::Shr => "shr",
+                    ShiftKind::Sar => "sar",
+                }
+            ),
             Self::Jmp(jmp) => write!(f, "\tjmp {jmp}"),
             Self::Ret => write!(f, "\tret"),
             Self::Label(lbl) => write!(f, "{lbl}:"),
@@ -1804,9 +1913,15 @@ impl X86Instruction {
             Self::Add(dst, src)
             | Self::Sub(dst, src)
             | Self::IMul2(dst, src)
+            | Self::And(dst, src)
+            | Self::Or(dst, src)
             | Self::Xor(dst, src) => (
                 src.reg_reads().into_iter().chain(dst.reg_reads()).collect(),
                 dst.as_reg().into_iter().copied().collect(),
+            ),
+            Self::Shift(_, dst, cnt) => (
+                dst.reg_reads().into_iter().chain(cnt.reg_reads()).collect(),
+                cnt.as_reg().into_iter().copied().collect(),
             ),
             Self::IMul1(src) => (
                 src.as_reg().map_or_else(
@@ -1891,7 +2006,10 @@ impl X86Instruction {
             | Self::Add(a, b)
             | Self::Sub(a, b)
             | Self::IMul2(a, b)
+            | Self::And(a, b)
+            | Self::Or(a, b)
             | Self::Xor(a, b)
+            | Self::Shift(_, a, b)
             | Self::Cmp(a, b)
             | Self::Test(a, b)
             | Self::Lea(a, b) => {

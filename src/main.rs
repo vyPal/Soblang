@@ -38,9 +38,9 @@ notone:
     ret %9
 }
 
-fn main() -> i32 {
+fn main(%0: i32) -> i32 {
 entry:
-    %0: i32 = const 6
+;    %0: i32 = const 6
     %1: i32 = call fib(%0)
     ret %1
 }

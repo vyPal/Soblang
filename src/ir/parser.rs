@@ -377,6 +377,19 @@ impl<'t> Parser<'t> {
             "sdiv" => Some(IROp::SDiv),
             "urem" => Some(IROp::URem),
             "srem" => Some(IROp::SRem),
+            "and" => Some(IROp::And),
+            "or" => Some(IROp::Or),
+            "xor" => Some(IROp::Xor),
+            "shl" => Some(IROp::Shl),
+            "ashr" => Some(IROp::AShr),
+            "lshr" => Some(IROp::LShr),
+            _ => None,
+        };
+
+        let unop: Option<fn(Value) -> IROp> = match m.as_str() {
+            "zext" => Some(IROp::ZExt),
+            "sext" => Some(IROp::SExt),
+            "trunc" => Some(IROp::Trunc),
             _ => None,
         };
 
@@ -384,6 +397,8 @@ impl<'t> Parser<'t> {
             let a = self.value()?;
             self.expect(Tok::Comma, "`,`")?;
             make(a, self.value()?)
+        } else if let Some(make) = unop {
+            make(self.value()?)
         } else {
             match m.as_str() {
                 "const" => IROp::Const(self.int("a constant")?.0),

@@ -87,6 +87,19 @@ pub enum IROp {
     URem(Value, Value),
     SRem(Value, Value),
 
+    // Bitwise
+    And(Value, Value),
+    Or(Value, Value),
+    Xor(Value, Value),
+    Shl(Value, Value),
+    AShr(Value, Value),
+    LShr(Value, Value),
+
+    // Conversions
+    ZExt(Value),
+    SExt(Value),
+    Trunc(Value),
+
     // Control flow
     Jmp(String),
     ICmp(ICmpKind, Value, Value),

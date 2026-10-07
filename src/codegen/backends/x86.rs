@@ -1,7 +1,9 @@
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     fmt::Display,
     io::Write,
+    vec,
 };
 
 use miette::{IntoDiagnostic, Result, bail};
@@ -11,22 +13,63 @@ use crate::{
         CodegenBackend, TargetAssembly, TargetInfo,
         backends::x86::Reg::{Physical, Virtual},
     },
-    ir::{self, ICmpKind, IRFunction, IRInst, IRModule, IROp, Param, Value},
+    ir::{self, GlobalInit, ICmpKind, IRFunction, IRGlobal, IRInst, IRModule, IROp, Param, Value},
 };
 
 pub struct X86Assembly {
     pub insts: Vec<X86Instruction>,
-    pub globals: Vec<String>,
+    pub exports: Vec<String>,
+    pub externs: Vec<String>,
+    pub data: Vec<IRGlobal>,
+    pub is_64: bool,
 }
 
 impl TargetAssembly for X86Assembly {
     fn emit_asm<W: Write>(&self, w: &mut W) -> Result<()> {
-        writeln!(w, "section .text").into_diagnostic()?;
-        for g in self.globals.iter() {
+        if self.is_64 {
+            writeln!(w, "default rel").into_diagnostic()?;
+        }
+        for e in &self.externs {
+            writeln!(w, "extern {e}").into_diagnostic()?;
+        }
+        for g in &self.exports {
             writeln!(w, "global {g}").into_diagnostic()?;
         }
+        writeln!(w, "section .text").into_diagnostic()?;
         for i in self.insts.iter() {
             writeln!(w, "{i}").into_diagnostic()?;
+        }
+
+        for (section, mutable, zeroed) in [
+            (".rodata", false, None),
+            (".data", true, Some(false)),
+            (".bss", true, Some(true)),
+        ] {
+            let items: Vec<&IRGlobal> = self
+                .data
+                .iter()
+                .filter(|g| g.mutable == mutable)
+                .filter(|g| zeroed.is_none_or(|z| matches!(g.init, GlobalInit::Zeroed(_)) == z))
+                .collect();
+            if items.is_empty() {
+                continue;
+            }
+            writeln!(w, "section {section}").into_diagnostic()?;
+            for g in items {
+                writeln!(w, "align {}", g.align).into_diagnostic()?;
+                match &g.init {
+                    GlobalInit::Zeroed(n) if section == ".bss" => {
+                        writeln!(w, "{}: resb {n}", g.name)
+                    }
+                    GlobalInit::Zeroed(n) => writeln!(w, "{}: times {n} db 0", g.name),
+                    GlobalInit::Bytes(b) if b.is_empty() => writeln!(w, "{}:", g.name),
+                    GlobalInit::Bytes(b) => {
+                        let list: Vec<String> = b.iter().map(u8::to_string).collect();
+                        writeln!(w, "{}: db {}", g.name, list.join(", "))
+                    }
+                }
+                .into_diagnostic()?;
+            }
         }
         Ok(())
     }
@@ -40,14 +83,40 @@ impl CodegenBackend for X86Codegen {
     fn compile_module(&self, module: IRModule, target: TargetInfo) -> Result<Self::Assembly> {
         let features = X86Features::from_target_info(target);
         let mut insts = Vec::new();
-        let mut globals = Vec::new();
+        let mut exports = Vec::new();
 
-        for f in module.functions {
-            insts.extend(self.compile_function(&f, &features)?);
-            globals.push(f.name);
+        let mut callees = HashMap::new();
+        for f in &module.functions {
+            callees.insert(
+                f.name.clone(),
+                CalleeInfo {
+                    is_extern: false,
+                    is_variadic: false,
+                },
+            );
+        }
+        for e in &module.externs {
+            callees.insert(
+                e.name.clone(),
+                CalleeInfo {
+                    is_extern: true,
+                    is_variadic: e.variadic,
+                },
+            );
         }
 
-        Ok(X86Assembly { insts, globals })
+        for f in module.functions {
+            insts.extend(self.compile_function(&f, &features, callees.clone())?);
+            exports.push(f.name);
+        }
+
+        Ok(X86Assembly {
+            insts,
+            exports,
+            externs: module.externs.iter().map(|e| e.name.clone()).collect(),
+            data: module.globals,
+            is_64: features.is_64(),
+        })
     }
 }
 
@@ -56,6 +125,7 @@ impl X86Codegen {
         &self,
         function: &IRFunction,
         feat: &X86Features,
+        callees: HashMap<String, CalleeInfo>,
     ) -> Result<Vec<X86Instruction>> {
         let mut value_widths = HashMap::new();
         for param in &function.params {
@@ -81,6 +151,8 @@ impl X86Codegen {
             value_widths: value_widths.clone(),
             alloca_layout,
             consts,
+            callees,
+            next_temp: Cell::new(value_widths.keys().max().copied().unwrap_or_default() + 1),
         };
         let uses = self.calc_uses(function);
         let mut asm = Vec::new();
@@ -402,10 +474,22 @@ impl X86Codegen {
                     ));
                 }
 
-                asm.push(X86Instruction::Call(
-                    target.clone(),
-                    cc.caller_saved().to_vec(),
-                ));
+                let info = &ctx.callees[target];
+                let mut uses = int_regs[..reg_args.len()].to_vec();
+                if info.is_variadic && feat.is_64() {
+                    asm.push(X86Instruction::Mov(
+                        Operand::Reg(Reg::Physical(PhysReg::A, Width::W32)),
+                        Operand::Imm(0, Width::W32),
+                    ));
+                    uses.push(PhysReg::A);
+                }
+
+                asm.push(X86Instruction::Call {
+                    target: target.clone(),
+                    uses,
+                    clobbers: cc.caller_saved().to_vec(),
+                    plt: info.is_extern && feat.is_64(),
+                });
 
                 if cc.caller_cleans_stack() && total_bytes > 0 {
                     asm.push(X86Instruction::Add(
@@ -421,6 +505,33 @@ impl X86Codegen {
                     ));
                 }
             }
+            IROp::PtrAdd(p, off) => {
+                let pw = feat.max_width();
+                let ow = ctx.value_widths[&off];
+                let off_op = match ctx.operand(off, pw) {
+                    imm @ Operand::Imm(..) => imm,
+                    _ if ow == pw => Operand::Reg(Reg::Virtual(off, pw)),
+                    _ => {
+                        let t = ctx.fresh();
+                        asm.push(X86Instruction::Movsx(
+                            Operand::Reg(Reg::Virtual(t, pw)),
+                            Operand::Reg(Reg::Virtual(off, ow)),
+                        ));
+                        Operand::Reg(Reg::Virtual(t, pw))
+                    }
+                };
+                asm.push(X86Instruction::BinOp(
+                    BinKind::Add,
+                    dst,
+                    Operand::Reg(Reg::Virtual(p, pw)),
+                    off_op,
+                ));
+            }
+            IROp::GlobalAddr(ref name) => asm.push(X86Instruction::LeaGlobal {
+                dst,
+                name: name.clone(),
+                rip_relative: feat.is_64(),
+            }),
             IROp::Alloca(_) => {
                 let local_offset = ctx.alloca_layout.local_offsets[&dst_value];
                 asm.push(X86Instruction::Lea(
@@ -534,12 +645,20 @@ impl CallingConvention for SysV32 {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct CalleeInfo {
+    pub is_extern: bool,
+    pub is_variadic: bool,
+}
+
 pub struct FunctionContext {
     pub func_name: String,
     pub epilogue_label: String,
     pub value_widths: HashMap<Value, Width>,
     pub alloca_layout: AllocaLayout,
     pub consts: HashMap<Value, i64>,
+    pub callees: HashMap<String, CalleeInfo>,
+    pub next_temp: Cell<Value>,
 }
 
 impl FunctionContext {
@@ -548,6 +667,12 @@ impl FunctionContext {
             Some(c) => Operand::Imm(*c, w),
             None => Operand::Reg(Reg::Virtual(v, w)),
         }
+    }
+
+    fn fresh(&self) -> Value {
+        let v = self.next_temp.get();
+        self.next_temp.set(v + 1);
+        v
     }
 }
 
@@ -708,7 +833,7 @@ impl X86Codegen {
         for b in &func.blocks {
             for inst in &b.instructions {
                 match &inst.op {
-                    IROp::Const(_) | IROp::Jmp(_) | IROp::Alloca(_) => {}
+                    IROp::Const(_) | IROp::Jmp(_) | IROp::Alloca(_) | IROp::GlobalAddr(_) => {}
                     IROp::Br(a, _, _)
                     | IROp::Load(a, _)
                     | IROp::ZExt(a)
@@ -733,7 +858,8 @@ impl X86Codegen {
                     | IROp::Xor(a, b)
                     | IROp::Shl(a, b)
                     | IROp::AShr(a, b)
-                    | IROp::LShr(a, b) => {
+                    | IROp::LShr(a, b)
+                    | IROp::PtrAdd(a, b) => {
                         *uses.entry(*a).or_default() += 1;
                         *uses.entry(*b).or_default() += 1;
                     }
@@ -768,6 +894,11 @@ impl X86Codegen {
                     IROp::Add(a, b) | IROp::Sub(a, b) | IROp::Mul(a, b) => {
                         if let Some(ref res) = inst.meta.result {
                             copy_hints.insert(res.id, vec![*a, *b]);
+                        }
+                    }
+                    IROp::Shl(a, _) | IROp::AShr(a, _) | IROp::LShr(a, _) => {
+                        if let Some(ref res) = inst.meta.result {
+                            copy_hints.insert(res.id, vec![*a]);
                         }
                     }
                     IROp::Call(_, args) => {
@@ -1839,8 +1970,18 @@ pub enum X86Instruction {
     SetCC(CondCode, Operand),
     Test(Operand, Operand),
     Jcc(CondCode, String),
-    Call(String, Vec<PhysReg>),
+    Call {
+        target: String,
+        uses: Vec<PhysReg>,
+        clobbers: Vec<PhysReg>,
+        plt: bool,
+    },
     Lea(Operand, Operand),
+    LeaGlobal {
+        dst: Operand,
+        name: String,
+        rip_relative: bool,
+    },
 
     // Pseudo instructions
     ParallelMovs(Vec<(Operand, Operand)>),
@@ -1888,9 +2029,24 @@ impl Display for X86Instruction {
             Self::SetCC(cc, dst) => write!(f, "\tset{cc} {dst}"),
             Self::Test(val1, val2) => write!(f, "\ttest {val1}, {val2}"),
             Self::Jcc(cc, jmp) => write!(f, "\tj{cc} {jmp}"),
-            Self::Call(target, _) => write!(f, "\tcall {target}"),
+            Self::Call {
+                target, plt: true, ..
+            } => write!(f, "\tcall {target} wrt ..plt"),
+            Self::Call { target, .. } => write!(f, "\tcall {target}"),
             Self::Lea(dst, src) => write!(f, "\tlea {dst}, {src}"),
-            Self::ParallelMovs(_) | Self::BinOp(..) | Self::Neg(_) => unreachable!(),
+            Self::LeaGlobal {
+                dst,
+                name,
+                rip_relative: true,
+            } => write!(f, "\tlea {dst}, [rel {name}]"),
+            Self::LeaGlobal {
+                dst,
+                name,
+                rip_relative: false,
+            } => write!(f, "\tmov {dst}, {name}"),
+            Self::ParallelMovs(_) | Self::BinOp(..) | Self::Neg(_) => {
+                unreachable!()
+            }
         }
     }
 }
@@ -1974,13 +2130,14 @@ impl X86Instruction {
                 vec![],
             ),
             Self::SetCC(_, dst) => (vec![], dst.as_reg().map_or_default(|r| vec![*r])),
-            Self::Call(_, clobber) => (
-                vec![],
-                clobber
+            Self::Call { uses, clobbers, .. } => (
+                uses.iter().map(|&r| Reg::Physical(r, Width::W64)).collect(),
+                clobbers
                     .iter()
                     .map(|&r| Reg::Physical(r, Width::W64))
                     .collect(),
             ),
+            Self::LeaGlobal { dst, .. } => (vec![], dst.as_reg().into_iter().copied().collect()),
             Self::ParallelMovs(movs) => (
                 movs.iter().flat_map(|(_, src)| src.reg_reads()).collect(),
                 movs.iter()
@@ -2021,7 +2178,8 @@ impl X86Instruction {
             | Self::IDiv(a)
             | Self::Push(a)
             | Self::Pop(a)
-            | Self::SetCC(_, a) => a.replace_vregs_with(f),
+            | Self::SetCC(_, a)
+            | Self::LeaGlobal { dst: a, .. } => a.replace_vregs_with(f),
             Self::Cbw
             | Self::Cwd
             | Self::Cdq
@@ -2030,7 +2188,7 @@ impl X86Instruction {
             | Self::Label(_)
             | Self::Ret
             | Self::Jcc(_, _)
-            | Self::Call(_, _) => {}
+            | Self::Call { .. } => {}
             Self::ParallelMovs(movs) => {
                 for mov in movs {
                     mov.0.replace_vregs_with(&mut f);

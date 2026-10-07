@@ -4,8 +4,8 @@ use miette::{Diagnostic, NamedSource, Result, SourceSpan};
 use thiserror::Error;
 
 use crate::ir::{
-    ICmpKind, IRBlock, IRFunction, IRInst, IRInstFlags, IRInstMeta, IRModule, IROp, IRResult,
-    Param, Value, Width,
+    GlobalInit, ICmpKind, IRBlock, IRExtern, IRFunction, IRGlobal, IRInst, IRInstFlags, IRInstMeta,
+    IRModule, IROp, IRResult, Param, Value, Width,
 };
 
 #[derive(Debug, Error, Diagnostic)]
@@ -71,7 +71,10 @@ enum Tok {
     Ident(String),
     Val(Value),
     Int(i64),
+    Global(String),
+    Str(Vec<u8>),
     LParen, RParen, LBrace, RBrace,
+    LBracket, RBracket,
     Comma, Colon, Eq, Arrow,
     Newline, Eof,
 }
@@ -82,10 +85,14 @@ impl Tok {
             Tok::Ident(s) => format!("`{s}`"),
             Tok::Val(v) => format!("`%{v}`"),
             Tok::Int(i) => format!("`{i}`"),
+            Tok::Global(g) => format!("`@{g}`"),
+            Tok::Str(_) => "string literal".into(),
             Tok::LParen => "`(`".into(),
             Tok::RParen => "`)`".into(),
             Tok::LBrace => "`{`".into(),
             Tok::RBrace => "`}`".into(),
+            Tok::LBracket => "`[`".into(),
+            Tok::RBracket => "`]`".into(),
             Tok::Comma => "`,`".into(),
             Tok::Colon => "`:`".into(),
             Tok::Eq => "`=`".into(),
@@ -150,6 +157,13 @@ fn lex(src: &str, errs: &mut Vec<PErr>) -> Vec<Token> {
                 push(&mut out, Tok::RBrace, start, i + 1);
                 i += 1;
             }
+            b'[' => {
+                push(&mut out, Tok::LBracket, start, i + 1);
+                i += 1;
+            }
+            b']' => {
+                push(&mut out, Tok::RBracket, start, i + 1);
+            }
             b',' => {
                 push(&mut out, Tok::Comma, start, i + 1);
                 i += 1;
@@ -165,6 +179,100 @@ fn lex(src: &str, errs: &mut Vec<PErr>) -> Vec<Token> {
             b'-' if b.get(i + 1) == Some(&b'>') => {
                 push(&mut out, Tok::Arrow, start, i + 2);
                 i += 2;
+            }
+            b'@' => {
+                i += 1;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'.')
+                {
+                    i += 1;
+                }
+                if i == start + 1 {
+                    errs.push(PErr::new(
+                        "invalid global name",
+                        (start, 1).into(),
+                        "expected name after `@`",
+                    ));
+                } else {
+                    push(
+                        &mut out,
+                        Tok::Global(src[start + 1..i].to_string()),
+                        start,
+                        i,
+                    );
+                }
+            }
+            b'"' => {
+                i += 1;
+                let mut bytes = Vec::new();
+                let mut ok = true;
+                loop {
+                    match b.get(i) {
+                        None | Some(b'\n') => {
+                            errs.push(
+                                PErr::new(
+                                    "unterminated string literal",
+                                    (start, i - start).into(),
+                                    "string starts here",
+                                )
+                                .help("close it with `\"` on the same line"),
+                            );
+                            ok = false;
+                            break;
+                        }
+                        Some(b'"') => {
+                            i += 1;
+                            break;
+                        }
+                        Some(b'\\') => {
+                            let esc_start = i;
+                            i += 1;
+                            let byte = match b.get(i) {
+                                Some(b'n') => Some(b'\n'),
+                                Some(b't') => Some(b'\t'),
+                                Some(b'r') => Some(b'\r'),
+                                Some(b'0') => Some(0),
+                                Some(b'\\') => Some(b'\\'),
+                                Some(b'"') => Some(b'"'),
+                                Some(b'x') => {
+                                    let hex = src
+                                        .get(i + 1..i + 3)
+                                        .and_then(|h| u8::from_str_radix(h, 16).ok());
+                                    if hex.is_some() {
+                                        i += 2;
+                                    }
+                                    hex
+                                }
+                                _ => None,
+                            };
+                            match byte {
+                                Some(b) => {
+                                    bytes.push(b);
+                                    i += 1;
+                                }
+                                None => {
+                                    errs.push(
+                                        PErr::new(
+                                            "unknown escape",
+                                            (esc_start, 2).into(),
+                                            "unsupported escape sequence",
+                                        )
+                                        .help("supported: \\n, \\t, \\r, \\0, \\\\, \\\", \\xXX"),
+                                    );
+                                    ok = false;
+                                    i += 1;
+                                }
+                            }
+                        }
+                        Some(_) => {
+                            let ch = src[i..].chars().next().unwrap();
+                            bytes.extend_from_slice(ch.to_string().as_bytes());
+                            i += ch.len_utf8();
+                        }
+                    }
+                }
+                if ok {
+                    push(&mut out, Tok::Str(bytes), start, i);
+                }
             }
             b'%' => {
                 i += 1;
@@ -253,6 +361,10 @@ impl<'t> Parser<'t> {
         } else {
             false
         }
+    }
+
+    fn kw(&self, s: &str) -> bool {
+        matches!(&self.peek().tok, Tok::Ident(k) if s == k)
     }
 
     fn unexpected(&self, what: &str) -> PErr {
@@ -443,6 +555,18 @@ impl<'t> Parser<'t> {
                     Tok::RBrace | Tok::Newline | Tok::Eof => None,
                     _ => Some(self.value()?),
                 }),
+                "ptradd" => {
+                    let p = self.value()?;
+                    self.expect(Tok::Comma, "`,`")?;
+                    IROp::PtrAdd(p, self.value()?)
+                }
+                "globaladdr" => match self.peek().tok.clone() {
+                    Tok::Global(g) => {
+                        self.bump();
+                        IROp::GlobalAddr(g)
+                    }
+                    _ => return Err(self.unexpected("a global name starting with `@`")),
+                },
                 "alloca" => IROp::Alloca(self.uint("an allocation size")?),
                 "load" => {
                     let p = self.value()?;
@@ -565,8 +689,123 @@ impl<'t> Parser<'t> {
         })
     }
 
+    fn extern_decl(&mut self) -> PResult<IRExtern> {
+        self.bump();
+        if !self.kw("fn") {
+            return Err(self.unexpected("`fn`"));
+        }
+        self.bump();
+        let (name, _) = self.ident("a function name")?;
+        self.expect(Tok::LParen, "`(`")?;
+        let (mut args, mut variadic) = (Vec::new(), false);
+        if !self.eat(Tok::RParen) {
+            loop {
+                if self.kw("...") {
+                    self.bump();
+                    variadic = true;
+                    self.expect(Tok::RParen, "`)`")?;
+                    break;
+                }
+                args.push(self.ty()?);
+                if self.eat(Tok::RParen) {
+                    break;
+                }
+                self.expect(Tok::Comma, "`,` or `)`")?;
+            }
+        }
+
+        let ret = if self.eat(Tok::Arrow) {
+            Some(self.ty()?)
+        } else {
+            None
+        };
+
+        self.end_of_line()?;
+        Ok(IRExtern {
+            name,
+            args,
+            ret,
+            variadic,
+        })
+    }
+
+    fn global_decl(&mut self) -> PResult<IRGlobal> {
+        self.bump();
+        let (mut export, mut mutable) = (false, false);
+        loop {
+            if self.kw("export") {
+                export = true;
+                self.bump();
+            } else if self.kw("mut") {
+                mutable = true;
+                self.bump();
+            } else {
+                break;
+            }
+        }
+
+        let name = match self.peek().tok.clone() {
+            Tok::Global(g) => g,
+            _ => return Err(self.unexpected("a global name starting with `@`")),
+        };
+        self.bump();
+
+        let align = if self.kw("align") {
+            self.bump();
+            self.uint("alignment")?
+        } else {
+            1
+        };
+        self.expect(Tok::Eq, "`=`")?;
+
+        let init = match self.peek().tok.clone() {
+            Tok::Str(s) => {
+                self.bump();
+                GlobalInit::Bytes(s)
+            }
+            Tok::LBracket => {
+                self.bump();
+                let mut bytes = Vec::new();
+                if !self.eat(Tok::RBracket) {
+                    loop {
+                        let (n, span) = self.int("a byte value")?;
+                        let byte = u8::try_from(n)
+                            .ok()
+                            .or_else(|| i8::try_from(n).ok().map(|v| v as u8))
+                            .ok_or_else(|| {
+                                PErr::new("byte out of range", span, "must be in -128..=255")
+                            })?;
+                        bytes.push(byte);
+                        if self.eat(Tok::RBracket) {
+                            self.bump();
+                            break;
+                        }
+                        self.expect(Tok::Comma, "`,` or `]`")?;
+                    }
+                }
+                GlobalInit::Bytes(bytes)
+            }
+            _ if self.kw("zero") => {
+                self.bump();
+                GlobalInit::Zeroed(self.uint("size")?)
+            }
+            _ => return Err(self.unexpected("a string, `[bytes]`, or `zero N`")),
+        };
+
+        self.end_of_line()?;
+        Ok(IRGlobal {
+            name,
+            init,
+            align,
+            export,
+            mutable,
+        })
+    }
+
     fn module(&mut self, errs: &mut Vec<PErr>) -> IRModule {
         let mut functions = Vec::new();
+        let mut externs = Vec::new();
+        let mut globals = Vec::new();
         loop {
             self.skip_newlines();
             match &self.peek().tok {
@@ -576,6 +815,20 @@ impl<'t> Parser<'t> {
                     Err(e) => {
                         errs.push(e);
                         self.recover_block();
+                    }
+                },
+                Tok::Ident(k) if k == "extern" => match self.extern_decl() {
+                    Ok(ext) => externs.push(ext),
+                    Err(e) => {
+                        errs.push(e);
+                        self.recover_line();
+                    }
+                },
+                Tok::Ident(k) if k == "global" => match self.global_decl() {
+                    Ok(glob) => globals.push(glob),
+                    Err(e) => {
+                        errs.push(e);
+                        self.recover_line();
                     }
                 },
                 _ => {
@@ -589,7 +842,11 @@ impl<'t> Parser<'t> {
             }
         }
 
-        IRModule { functions }
+        IRModule {
+            functions,
+            externs,
+            globals,
+        }
     }
 }
 

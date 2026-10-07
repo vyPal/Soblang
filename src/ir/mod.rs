@@ -16,6 +16,28 @@ pub enum Width {
 
 pub struct IRModule {
     pub functions: Vec<IRFunction>,
+    pub externs: Vec<IRExtern>,
+    pub globals: Vec<IRGlobal>,
+}
+
+pub struct IRGlobal {
+    pub name: String,
+    pub init: GlobalInit,
+    pub align: u32,
+    pub export: bool,
+    pub mutable: bool,
+}
+
+pub enum GlobalInit {
+    Bytes(Vec<u8>),
+    Zeroed(u32),
+}
+
+pub struct IRExtern {
+    pub name: String,
+    pub args: Vec<Width>,
+    pub ret: Option<Width>,
+    pub variadic: bool,
 }
 
 pub struct IRFunction {
@@ -108,6 +130,9 @@ pub enum IROp {
     // Function calls
     Call(String, Vec<Value>),
     Ret(Option<Value>),
+
+    PtrAdd(Value, Value),
+    GlobalAddr(String),
 
     // Memory allocation
     Alloca(u32),

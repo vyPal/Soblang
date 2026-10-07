@@ -16,6 +16,12 @@ fn main() -> Result<()> {
     let module = parse_module(
         "test.sob",
         r#"
+extern fn printf(ptr, ...) -> i32
+extern fn atoi(ptr) -> i32
+
+global @fmt align 1 = "fib(%d) = %d\n\0"
+global @usage align 1 = "usage: %s <n>\n\0"
+
 fn fib(%0: i32) -> i32 {
 entry:
     %1: i32 = const 0
@@ -38,11 +44,25 @@ notone:
     ret %9
 }
 
-fn main(%0: i32) -> i32 {
+fn main(%0: i32, %1: ptr) -> i32 {
 entry:
-;    %0: i32 = const 6
-    %1: i32 = call fib(%0)
-    ret %1
+    %2: i32 = const 2
+    %3: i32 = icmp slt %0, %2
+    br %3, usage, run
+usage:
+    %4: ptr = load %1, 0
+    %5: ptr = globaladdr @usage
+    %6: i32 = call printf(%5, %4)
+    %7: i32 = const 1
+    ret %7
+run:
+    %8: ptr = load %1, 8
+    %9: i32 = call atoi(%8)
+    %10: i32 = call fib(%9)
+    %11: ptr = globaladdr @fmt
+    %12: i32 = call printf(%11, %9, %10)
+    %13: i32 = const 0
+    ret %13
 }
     "#,
     )?;

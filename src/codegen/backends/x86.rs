@@ -153,6 +153,7 @@ impl X86Codegen {
             consts,
             callees,
             next_temp: Cell::new(value_widths.keys().max().copied().unwrap_or_default() + 1),
+            out_bytes: Cell::new(0),
         };
         let uses = self.calc_uses(function);
         let mut asm = Vec::new();
@@ -183,27 +184,65 @@ impl X86Codegen {
         let (allocations, spill_slots) =
             self.allocate_registers(intervals, hints, copy_hints, feat)?;
 
-        let callee_saved = self.callee_saved_used(&allocations, feat);
+        let body = self.apply_allocations(asm, &allocations, feat);
+        let body = self.expand_pseudo_insts(body, feat);
+        let body = self.peephole(body);
+
+        let mut body = [
+            self.emit_param_moves(function, allocations, value_widths, feat),
+            body,
+        ]
+        .concat();
+
+        let callee_saved = self.callee_saved_used(&body, feat);
+        let has_calls = body
+            .iter()
+            .any(|i| matches!(i, X86Instruction::Call { .. }));
         let frame = self.build_frame_info(
             callee_saved,
             ctx.alloca_layout.total_bytes,
             spill_slots,
+            ctx.out_bytes.get(),
+            has_calls,
             feat,
         );
 
-        let body = self.apply_allocations(asm, &allocations, &frame, feat);
-        let body = self.expand_pseudo_insts(body, feat);
-        let mut body = self.peephole(body);
-
+        let ret_label = format!("{}.ret", function.name);
+        let prologue = self.emit_prologue(&frame, feat);
         let mut insts = vec![X86Instruction::Label(ctx.func_name)];
-        insts.extend(self.emit_prologue(&frame, feat));
-        insts.extend(self.emit_param_moves(function, allocations, value_widths, &frame, feat));
+        match self.shrink_wrap(&body, &frame.callee_saved) {
+            Some(sw) => {
+                let pw = feat.max_width();
+                let w = feat.word_bytes();
+                let slot = feat.cc().stack_arg_size() as i32;
+                for &idx in &sw.frameless {
+                    if let X86Instruction::Jmp(l) | X86Instruction::Jcc(_, l) = &mut body[idx]
+                        && *l == ctx.epilogue_label
+                    {
+                        *l = ret_label.clone();
+                    }
+                    for op in body[idx].operands_mut() {
+                        if let Operand::Frame(FrameRef::InArg(i), width) = *op {
+                            *op = Operand::Mem {
+                                base: Reg::Physical(PhysReg::Sp, pw),
+                                offset: w + i as i32 * slot,
+                                width,
+                            };
+                        }
+                    }
+                }
+                body.splice(sw.insert_at..sw.insert_at, prologue);
+            }
+            None => insts.extend(prologue),
+        }
         insts.append(&mut body);
         insts.push(X86Instruction::Label(ctx.epilogue_label));
-        let mut insts = self.cleanup_control_flow(insts, &function.name);
         insts.extend(self.emit_epilogue(&frame, feat));
+        insts.push(X86Instruction::Label(ret_label));
+        insts.push(X86Instruction::Ret);
 
-        Ok(insts)
+        let insts = self.resolve_frame(insts, &frame, feat);
+        Ok(self.cleanup_control_flow(insts, &function.name))
     }
 
     pub fn lower_inst(
@@ -453,14 +492,7 @@ impl X86Codegen {
                 }
 
                 let raw_bytes = stack_args.len() as u32 * slot;
-                let total_bytes = raw_bytes.div_ceil(16) * 16;
-
-                if total_bytes > 0 {
-                    asm.push(X86Instruction::Sub(
-                        Operand::Reg(Reg::Physical(PhysReg::Sp, pw)),
-                        Operand::Imm(total_bytes as i64, pw),
-                    ));
-                }
+                ctx.out_bytes.set(ctx.out_bytes.get().max(raw_bytes));
 
                 for (i, arg) in stack_args.iter().enumerate() {
                     let w = ctx.value_widths[arg];
@@ -490,13 +522,6 @@ impl X86Codegen {
                     clobbers: cc.caller_saved().to_vec(),
                     plt: info.is_extern && feat.is_64(),
                 });
-
-                if cc.caller_cleans_stack() && total_bytes > 0 {
-                    asm.push(X86Instruction::Add(
-                        Operand::Reg(Reg::Physical(PhysReg::Sp, feat.max_width())),
-                        Operand::Imm(total_bytes as i64, feat.max_width()),
-                    ));
-                }
 
                 if width != Width::W0 {
                     asm.push(X86Instruction::Mov(
@@ -536,11 +561,7 @@ impl X86Codegen {
                 let local_offset = ctx.alloca_layout.local_offsets[&dst_value];
                 asm.push(X86Instruction::Lea(
                     dst,
-                    Operand::Mem {
-                        base: Reg::Physical(PhysReg::Bp, feat.max_width()),
-                        offset: -(local_offset as i32),
-                        width,
-                    },
+                    Operand::Frame(FrameRef::Alloca(local_offset), width),
                 ));
             }
             IROp::Load(addr, offset) => {
@@ -613,6 +634,7 @@ impl CallingConvention for SysV64 {
             PhysReg::R13,
             PhysReg::R14,
             PhysReg::R15,
+            PhysReg::Bp,
         ]
     }
     fn caller_cleans_stack(&self) -> bool {
@@ -635,7 +657,7 @@ impl CallingConvention for SysV32 {
         &[PhysReg::A, PhysReg::C, PhysReg::D]
     }
     fn callee_saved(&self) -> &'static [PhysReg] {
-        &[PhysReg::B, PhysReg::Si, PhysReg::Di]
+        &[PhysReg::B, PhysReg::Si, PhysReg::Di, PhysReg::Bp]
     }
     fn caller_cleans_stack(&self) -> bool {
         true
@@ -659,6 +681,7 @@ pub struct FunctionContext {
     pub consts: HashMap<Value, i64>,
     pub callees: HashMap<String, CalleeInfo>,
     pub next_temp: Cell<Value>,
+    pub out_bytes: Cell<u32>,
 }
 
 impl FunctionContext {
@@ -719,8 +742,22 @@ pub struct ActiveEntry {
 
 pub struct FrameInfo {
     pub callee_saved: Vec<PhysReg>,
-    pub alloca_bytes: u32,
+    pub out_bytes: u32,
+    pub alloca_base: u32,
     pub local_bytes: u32,
+    pub frame_pointer: bool,
+}
+
+pub struct ShrinkWrap {
+    pub insert_at: usize,
+    pub frameless: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FrameRef {
+    Alloca(u32),
+    Spill(u32),
+    InArg(u32),
 }
 
 pub struct AllocaLayout {
@@ -763,6 +800,22 @@ impl X86Codegen {
 
         loop {
             let before = insts.len();
+
+            let ret_labels: HashSet<String> = (0..insts.len())
+                .filter_map(|i| match &insts[i] {
+                    Label(l) => insts[i..]
+                        .iter()
+                        .find(|x| !matches!(x, Label(_)))
+                        .filter(|x| matches!(x, Ret))
+                        .map(|_| l.clone()),
+                    _ => None,
+                })
+                .collect();
+            for i in insts.iter_mut() {
+                if matches!(i, Jmp(l) if ret_labels.contains(l)) {
+                    *i = Ret;
+                }
+            }
 
             let referenced: HashSet<String> = insts
                 .iter()
@@ -995,6 +1048,8 @@ impl X86Codegen {
                             out.push(X86Instruction::Neg(dst));
                             out.push(X86Instruction::Add(dst, a));
                         }
+                    } else if let Some(lea) = self.try_lea(k, dst, a, b, feat) {
+                        out.push(lea);
                     } else {
                         out.push(X86Instruction::Mov(dst, a));
                         out.push(op(dst, b));
@@ -1007,25 +1062,206 @@ impl X86Codegen {
         out
     }
 
-    fn spill_operand(
+    fn try_lea(
         &self,
-        frame: &FrameInfo,
+        k: BinKind,
+        dst: Operand,
+        a: Operand,
+        b: Operand,
         feat: &X86Features,
-        slot: u32,
-        width: Width,
-    ) -> Operand {
+    ) -> Option<X86Instruction> {
+        let (a, b) = match (k, a, b) {
+            (BinKind::Add, a @ Operand::Imm(..), b @ Operand::Reg(_)) => (b, a),
+            (BinKind::Add | BinKind::Sub, a, b) => (a, b),
+            _ => return None,
+        };
+        let (Operand::Reg(dreg), Operand::Reg(Reg::Physical(base, _)), Operand::Imm(imm, _)) =
+            (dst, a, b)
+        else {
+            return None;
+        };
+        if !matches!(dreg.width(), Width::W32 | Width::W64) {
+            return None;
+        }
+        let offset = i32::try_from(if k == BinKind::Sub {
+            imm.checked_neg()?
+        } else {
+            imm
+        })
+        .ok()?;
+        Some(X86Instruction::Lea(
+            dst,
+            Operand::Mem {
+                base: Reg::Physical(base, feat.max_width()),
+                offset,
+                width: dreg.width(),
+            },
+        ))
+    }
+
+    fn spill_operand(&self, slot: u32, width: Width) -> Operand {
+        Operand::Frame(FrameRef::Spill(slot), width)
+    }
+
+    fn frame_offset(&self, r: FrameRef, frame: &FrameInfo, feat: &X86Features) -> (PhysReg, i32) {
         let w = feat.word_bytes();
-        let spill_base = w * frame.callee_saved.len() as i32 + frame.alloca_bytes as i32;
-        Operand::Mem {
-            base: Reg::Physical(PhysReg::Bp, feat.max_width()),
-            offset: -(spill_base + (slot as i32 + 1) * w),
-            width,
+        let top = frame.local_bytes as i32 + frame.callee_saved.len() as i32 * w;
+        let rsp_off = match r {
+            FrameRef::Spill(s) => frame.out_bytes as i32 + s as i32 * w,
+            FrameRef::Alloca(o) => (frame.alloca_base + o) as i32,
+            FrameRef::InArg(i) => {
+                let saved_bp = if frame.frame_pointer { w } else { 0 };
+                top + saved_bp + w + i as i32 * feat.cc().stack_arg_size() as i32
+            }
+        };
+        if frame.frame_pointer {
+            (PhysReg::Bp, rsp_off - top)
+        } else {
+            (PhysReg::Sp, rsp_off)
         }
     }
 
-    fn incoming_stack_args_offset(&self, stack_idx: u32, feat: &X86Features) -> i32 {
-        let ret_and_saved_bp = if feat.is_64() { 16 } else { 8 };
-        ret_and_saved_bp + (stack_idx * feat.cc().stack_arg_size()) as i32
+    fn resolve_frame(
+        &self,
+        mut insts: Vec<X86Instruction>,
+        frame: &FrameInfo,
+        feat: &X86Features,
+    ) -> Vec<X86Instruction> {
+        for inst in insts.iter_mut() {
+            for op in inst.operands_mut() {
+                if let Operand::Frame(r, width) = *op {
+                    let (base, offset) = self.frame_offset(r, frame, feat);
+                    *op = Operand::Mem {
+                        base: Reg::Physical(base, feat.max_width()),
+                        offset,
+                        width,
+                    };
+                }
+            }
+        }
+        insts
+    }
+
+    fn shrink_wrap(&self, body: &[X86Instruction], callee_saved: &[PhysReg]) -> Option<ShrinkWrap> {
+        use X86Instruction::*;
+
+        let mut starts = vec![0];
+        starts.extend(
+            body.iter()
+                .enumerate()
+                .skip(1)
+                .filter(|(_, i)| matches!(i, Label(_)))
+                .map(|(i, _)| i),
+        );
+        let n = starts.len();
+        let end = |b: usize| starts.get(b + 1).copied().unwrap_or(body.len());
+        let label_block: HashMap<&str, usize> = starts
+            .iter()
+            .enumerate()
+            .filter_map(|(b, &i)| match body.get(i) {
+                Some(Label(l)) => Some((l.as_str(), b)),
+                _ => None,
+            })
+            .collect();
+
+        let mut succs = vec![Vec::new(); n];
+        for (b, s) in succs.iter_mut().enumerate() {
+            let insts = &body[starts[b]..end(b)];
+            for i in insts {
+                if let Jmp(l) | Jcc(_, l) = i
+                    && let Some(&t) = label_block.get(l.as_str())
+                {
+                    s.push(t);
+                }
+            }
+            if !matches!(insts.last(), Some(Jmp(_) | Ret)) && b + 1 < n {
+                s.push(b + 1);
+            }
+        }
+
+        let reach_from = |s: usize| {
+            let mut seen = vec![false; n];
+            let mut stack = vec![s];
+            while let Some(b) = stack.pop() {
+                if !seen[b] {
+                    seen[b] = true;
+                    stack.extend(&succs[b]);
+                }
+            }
+            seen
+        };
+        let reachable = reach_from(0);
+
+        let mut preds = vec![Vec::new(); n];
+        for b in (0..n).filter(|&b| reachable[b]) {
+            for &s in &succs[b] {
+                preds[s].push(b);
+            }
+        }
+
+        let mut dom = vec![vec![true; n]; n];
+        dom[0] = (0..n).map(|i| i == 0).collect();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in (1..n).filter(|&b| reachable[b]) {
+                let mut new = vec![true; n];
+                for &p in &preds[b] {
+                    for (x, d) in new.iter_mut().zip(&dom[p]) {
+                        *x &= *d;
+                    }
+                }
+                new[b] = true;
+                if new != dom[b] {
+                    dom[b] = new;
+                    changed = true;
+                }
+            }
+        }
+
+        let needs_frame = |i: &X86Instruction| {
+            if matches!(i, Call { .. }) {
+                return true;
+            }
+            if i.operands().iter().any(|o| {
+                matches!(
+                    o,
+                    Operand::Frame(FrameRef::Spill(_) | FrameRef::Alloca(_), _)
+                )
+            }) {
+                return true;
+            }
+            let (r, w) = i.get_register_rw();
+            r.iter().chain(&w).any(|r| {matches!(r.id(), RegId::Phys(p) if p ==PhysReg::Sp || callee_saved.contains(&p))})
+        };
+        let needy: Vec<usize> = (0..n)
+            .filter(|&b| reachable[b] && body[starts[b]..end(b)].iter().any(needs_frame))
+            .collect();
+        if needy.is_empty() {
+            return None;
+        }
+
+        let s = (0..n)
+            .filter(|&c| needy.iter().all(|&b| dom[b][c]))
+            .max_by_key(|&c| dom[c].iter().filter(|&&x| x).count())?;
+        if s == 0 {
+            return None;
+        }
+
+        let region = reach_from(s);
+        let closed = (0..n).all(|b| !region[b] || dom[b][s]);
+        let in_loop = (0..n).any(|b| region[b] && succs[b].contains(&s));
+        if !closed || in_loop {
+            return None;
+        }
+
+        Some(ShrinkWrap {
+            insert_at: starts[s] + 1,
+            frameless: (0..n)
+                .filter(|&b| reachable[b] && !region[b])
+                .flat_map(|b| starts[b]..end(b))
+                .collect(),
+        })
     }
 
     fn layout_allocas(&self, func: &IRFunction) -> AllocaLayout {
@@ -1037,7 +1273,7 @@ impl X86Codegen {
                 if let (IROp::Alloca(size), Some(res)) = (&inst.op, &inst.meta.result) {
                     let align = (*size).clamp(1, 16).next_power_of_two();
                     cursor = cursor.div_ceil(align) * align;
-                    local_offsets.insert(res.id, cursor + size);
+                    local_offsets.insert(res.id, cursor);
                     cursor += size;
                 }
             }
@@ -1298,32 +1534,18 @@ impl X86Codegen {
         &self,
         insts: Vec<X86Instruction>,
         allocations: &HashMap<Value, RegAllocation>,
-        frame: &FrameInfo,
         feat: &X86Features,
     ) -> Vec<X86Instruction> {
-        let callee_saved_bytes = feat.word_bytes() * frame.callee_saved.len() as i32;
         let scratch = feat.scratch_registers();
         let mut out = Vec::with_capacity(insts.len());
 
         for mut inst in insts {
-            if let X86Instruction::Lea(
-                _,
-                Operand::Mem {
-                    base: Reg::Physical(PhysReg::Bp, _),
-                    offset,
-                    ..
-                },
-            ) = &mut inst
-            {
-                *offset -= callee_saved_bytes;
-            }
-
             if let X86Instruction::ParallelMovs(movs) = &mut inst {
                 for (_, src) in movs.iter_mut() {
                     if let Operand::Reg(Reg::Virtual(v, w)) = *src {
                         *src = match allocations[&v] {
                             RegAllocation::Reg(r) => Operand::Reg(Reg::Physical(r, w)),
-                            RegAllocation::Spill(s) => self.spill_operand(frame, feat, s, w),
+                            RegAllocation::Spill(s) => self.spill_operand(s, w),
                         }
                     }
                 }
@@ -1336,7 +1558,7 @@ impl X86Codegen {
                     if let Operand::Reg(Reg::Virtual(v, w)) = *op
                         && let Some(RegAllocation::Spill(s)) = allocations.get(&v)
                     {
-                        *op = self.spill_operand(frame, feat, *s, w);
+                        *op = self.spill_operand(*s, w);
                     }
                 }
             }
@@ -1365,7 +1587,7 @@ impl X86Codegen {
                                     })
                                     .expect("no usable scratch register for spilled operand");
                                 assigned.push((v, s));
-                                let mem = self.spill_operand(frame, feat, *slot, width);
+                                let mem = self.spill_operand(*slot, width);
                                 let sreg = Operand::Reg(Reg::Physical(s, width));
                                 if reads.iter().any(|r| r.id() == RegId::Virt(v)) {
                                     pre.push(X86Instruction::Mov(sreg, mem));
@@ -1390,19 +1612,20 @@ impl X86Codegen {
         out
     }
 
-    pub fn callee_saved_used(
-        &self,
-        allocations: &HashMap<Value, RegAllocation>,
-        feat: &X86Features,
-    ) -> Vec<PhysReg> {
-        let scratch = feat.scratch_registers();
+    pub fn callee_saved_used(&self, body: &[X86Instruction], feat: &X86Features) -> Vec<PhysReg> {
+        let mut written = HashSet::new();
+        for inst in body {
+            for r in inst.get_register_rw().1 {
+                if let RegId::Phys(p) = r.id() {
+                    written.insert(p);
+                }
+            }
+        }
         feat.cc()
             .callee_saved()
             .iter()
             .copied()
-            .filter(|r| {
-                scratch.contains(r) || allocations.values().any(|a| *a == RegAllocation::Reg(*r))
-            })
+            .filter(|r| written.contains(r) && !(feat.frame_pointer && *r == PhysReg::Bp))
             .collect()
     }
 
@@ -1411,20 +1634,32 @@ impl X86Codegen {
         callee_saved: Vec<PhysReg>,
         alloca_total: u32,
         spill_slots: u32,
+        out_bytes: u32,
+        has_calls: bool,
         feat: &X86Features,
     ) -> FrameInfo {
         let w = feat.word_bytes() as u32;
-        let alloca_bytes = alloca_total.div_ceil(w) * w;
-        let raw = alloca_bytes + spill_slots * w;
-        let pushed = (2 + callee_saved.len() as u32) * w;
-        let mut local_bytes = raw;
-        while !(pushed + local_bytes).is_multiple_of(16) {
-            local_bytes += w;
+        let below_allocas = out_bytes + spill_slots * w;
+        let alloca_base = if alloca_total > 0 {
+            below_allocas.next_multiple_of(16)
+        } else {
+            below_allocas
+        };
+        let mut local_bytes = (alloca_base + alloca_total).next_multiple_of(w);
+
+        let pushed = (1 + feat.frame_pointer as u32 + callee_saved.len() as u32) * w;
+        if has_calls || alloca_total > 0 {
+            while !(pushed + local_bytes).is_multiple_of(16) {
+                local_bytes += w;
+            }
         }
+
         FrameInfo {
             callee_saved,
-            alloca_bytes,
+            out_bytes,
+            alloca_base,
             local_bytes,
+            frame_pointer: feat.frame_pointer,
         }
     }
 
@@ -1432,7 +1667,11 @@ impl X86Codegen {
         let bp = Operand::Reg(Reg::Physical(PhysReg::Bp, feat.max_width()));
         let sp = Operand::Reg(Reg::Physical(PhysReg::Sp, feat.max_width()));
 
-        let mut out = vec![X86Instruction::Push(bp), X86Instruction::Mov(bp, sp)];
+        let mut out = Vec::new();
+        if frame.frame_pointer {
+            out.push(X86Instruction::Push(bp));
+            out.push(X86Instruction::Mov(bp, sp));
+        }
         for r in frame.callee_saved.iter().rev() {
             out.push(X86Instruction::Push(Operand::Reg(Reg::Physical(
                 *r,
@@ -1454,11 +1693,9 @@ impl X86Codegen {
         func: &IRFunction,
         allocations: HashMap<Value, RegAllocation>,
         value_widths: HashMap<Value, Width>,
-        frame: &FrameInfo,
         feat: &X86Features,
     ) -> Vec<X86Instruction> {
         let int_regs = feat.cc().int_arg_registers();
-        let pw = feat.max_width();
         let scratch = feat.scratch_registers()[0];
         let mut spills = Vec::new();
         let mut reg_moves = Vec::new();
@@ -1473,18 +1710,14 @@ impl X86Codegen {
             if let Some(&arriving) = int_regs.get(i) {
                 match alloc {
                     RegAllocation::Spill(s) => spills.push(X86Instruction::Mov(
-                        self.spill_operand(frame, feat, s, w),
+                        self.spill_operand(s, w),
                         Operand::Reg(Reg::Physical(arriving, w)),
                     )),
                     RegAllocation::Reg(r) if r != arriving => reg_moves.push((arriving, r)),
                     _ => {}
                 }
             } else {
-                let src = Operand::Mem {
-                    base: Reg::Physical(PhysReg::Bp, pw),
-                    offset: self.incoming_stack_args_offset((i - int_regs.len()) as u32, feat),
-                    width: w,
-                };
+                let src = Operand::Frame(FrameRef::InArg((i - int_regs.len()) as u32), w);
                 match alloc {
                     RegAllocation::Reg(r) => {
                         stack_lods.push(X86Instruction::Mov(Operand::Reg(Reg::Physical(r, w)), src))
@@ -1492,10 +1725,7 @@ impl X86Codegen {
                     RegAllocation::Spill(s) => {
                         let t = Operand::Reg(Reg::Physical(scratch, w));
                         stack_lods.push(X86Instruction::Mov(t, src));
-                        stack_lods.push(X86Instruction::Mov(
-                            self.spill_operand(frame, feat, s, w),
-                            t,
-                        ));
+                        stack_lods.push(X86Instruction::Mov(self.spill_operand(s, w), t));
                     }
                 }
             }
@@ -1559,8 +1789,10 @@ impl X86Codegen {
                 feat.max_width(),
             ))));
         }
-        out.push(X86Instruction::Pop(bp));
         out.push(X86Instruction::Ret);
+        if frame.frame_pointer {
+            out.push(X86Instruction::Pop(bp));
+        }
         out
     }
 }
@@ -1578,6 +1810,7 @@ pub struct X86Features {
     pub avx1: bool,
     pub avx2: bool,
     pub avx512: bool,
+    pub frame_pointer: bool, // keep rbp as frame pointer (if false it becomes gp)
 }
 
 impl X86Features {
@@ -1597,6 +1830,7 @@ impl X86Features {
             avx1: false,
             avx2: false,
             avx512: false,
+            frame_pointer: false,
         }
     }
 
@@ -1625,6 +1859,13 @@ impl X86Features {
     }
 
     pub fn get_allocatable_registers(&self) -> Vec<PhysReg> {
+        let mut regs = self.base_allocatable_registers();
+        if !self.frame_pointer {
+            regs.push(PhysReg::Bp);
+        }
+        regs
+    }
+    fn base_allocatable_registers(&self) -> Vec<PhysReg> {
         if self.is_64() {
             vec![
                 PhysReg::C,
@@ -1773,6 +2014,7 @@ pub enum Operand {
         offset: i32,
         width: Width,
     },
+    Frame(FrameRef, Width),
 }
 
 impl Operand {
@@ -1780,6 +2022,7 @@ impl Operand {
         match self {
             Self::Reg(reg) => reg.width(),
             Self::Imm(_, width)
+            | Self::Frame(_, width)
             | Self::Mem {
                 base: _,
                 offset: _,
@@ -1837,8 +2080,13 @@ impl Display for Operand {
                     Width::W64 => "QWORD ",
                     _ => "",
                 };
-                write!(f, "{word}[{base} + {offset}]")
+                match offset {
+                    0 => write!(f, "{word}[{base}]"),
+                    o if *o < 0 => write!(f, "{word}[{base} - {}]", -(*o as i64)),
+                    o => write!(f, "{word}[{base} + {o}]"),
+                }
             }
+            Self::Frame(r, w) => write!(f, "<{r:?}.{w:?}>"),
         }
     }
 }
@@ -2077,7 +2325,7 @@ impl X86Instruction {
             ),
             Self::Shift(_, dst, cnt) => (
                 dst.reg_reads().into_iter().chain(cnt.reg_reads()).collect(),
-                cnt.as_reg().into_iter().copied().collect(),
+                dst.as_reg().into_iter().copied().collect(),
             ),
             Self::IMul1(src) => (
                 src.as_reg().map_or_else(
@@ -2201,6 +2449,64 @@ impl X86Instruction {
                 b.replace_vregs_with(f);
             }
             Self::Neg(a) => a.replace_vregs_with(f),
+        }
+    }
+
+    pub fn operands(&self) -> Vec<&Operand> {
+        match self {
+            Self::Mov(a, b)
+            | Self::Movzx(a, b)
+            | Self::Movsx(a, b)
+            | Self::Add(a, b)
+            | Self::Sub(a, b)
+            | Self::IMul2(a, b)
+            | Self::And(a, b)
+            | Self::Or(a, b)
+            | Self::Xor(a, b)
+            | Self::Shift(_, a, b)
+            | Self::Cmp(a, b)
+            | Self::Test(a, b)
+            | Self::Lea(a, b) => vec![a, b],
+            Self::IMul1(a)
+            | Self::Div(a)
+            | Self::IDiv(a)
+            | Self::Push(a)
+            | Self::Pop(a)
+            | Self::SetCC(_, a)
+            | Self::Neg(a)
+            | Self::LeaGlobal { dst: a, .. } => vec![a],
+            Self::BinOp(_, d, a, b) => vec![d, a, b],
+            Self::ParallelMovs(m) => m.iter().flat_map(|(d, s)| [d, s]).collect(),
+            _ => vec![],
+        }
+    }
+
+    pub fn operands_mut(&mut self) -> Vec<&mut Operand> {
+        match self {
+            Self::Mov(a, b)
+            | Self::Movzx(a, b)
+            | Self::Movsx(a, b)
+            | Self::Add(a, b)
+            | Self::Sub(a, b)
+            | Self::IMul2(a, b)
+            | Self::And(a, b)
+            | Self::Or(a, b)
+            | Self::Xor(a, b)
+            | Self::Shift(_, a, b)
+            | Self::Cmp(a, b)
+            | Self::Test(a, b)
+            | Self::Lea(a, b) => vec![a, b],
+            Self::IMul1(a)
+            | Self::Div(a)
+            | Self::IDiv(a)
+            | Self::Push(a)
+            | Self::Pop(a)
+            | Self::SetCC(_, a)
+            | Self::Neg(a)
+            | Self::LeaGlobal { dst: a, .. } => vec![a],
+            Self::BinOp(_, d, a, b) => vec![d, a, b],
+            Self::ParallelMovs(m) => m.iter_mut().flat_map(|(d, s)| [d, s]).collect(),
+            _ => vec![],
         }
     }
 }

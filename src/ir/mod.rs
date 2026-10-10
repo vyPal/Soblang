@@ -26,6 +26,7 @@ pub struct IRGlobal {
     pub align: u32,
     pub export: bool,
     pub mutable: bool,
+    pub span: Option<SourceSpan>,
 }
 
 pub enum GlobalInit {
@@ -38,6 +39,7 @@ pub struct IRExtern {
     pub args: Vec<Width>,
     pub ret: Option<Width>,
     pub variadic: bool,
+    pub span: Option<SourceSpan>,
 }
 
 pub struct IRFunction {
@@ -45,6 +47,7 @@ pub struct IRFunction {
     pub params: Vec<Param>,
     pub ret: Option<Width>,
     pub blocks: Vec<IRBlock>,
+    pub span: Option<SourceSpan>,
 }
 
 pub struct Param {

@@ -106,6 +106,7 @@ fn lex(src: &str, errs: &mut DiagCtx) -> Vec<Token> {
             }
             b']' => {
                 push(&mut out, Tok::RBracket, start, i + 1);
+                i += 1;
             }
             b',' => {
                 push(&mut out, Tok::Comma, start, i + 1);
@@ -636,6 +637,7 @@ impl<'t> Parser<'t> {
             params,
             ret,
             blocks,
+            span: Some(name_span),
         })
     }
 
@@ -645,7 +647,7 @@ impl<'t> Parser<'t> {
             return Err(self.unexpected("`fn`"));
         }
         self.bump();
-        let (name, _) = self.ident("a function name")?;
+        let (name, name_span) = self.ident("a function name")?;
         self.expect(Tok::LParen, "`(`")?;
         let (mut args, mut variadic) = (Vec::new(), false);
         if !self.eat(Tok::RParen) {
@@ -676,6 +678,7 @@ impl<'t> Parser<'t> {
             args,
             ret,
             variadic,
+            span: Some(name_span),
         })
     }
 
@@ -694,6 +697,7 @@ impl<'t> Parser<'t> {
             }
         }
 
+        let name_span = self.peek().span;
         let name = match self.peek().tok.clone() {
             Tok::Global(g) => g,
             _ => return Err(self.unexpected("a global name starting with `@`")),
@@ -749,6 +753,7 @@ impl<'t> Parser<'t> {
             align,
             export,
             mutable,
+            span: Some(name_span),
         })
     }
 

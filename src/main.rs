@@ -6,14 +6,16 @@ use crate::{
     codegen::{
         CodegenBackend, TargetAssembly, TargetInfo, TargetTriple, backends::x86::X86Codegen,
     },
+    diagnostics::{CompilerDiagnostic, DiagCtx, DiagnosticReport},
     ir::parser::parse_module,
 };
 
 pub mod codegen;
+pub mod diagnostics;
 pub mod ir;
 
 fn main() -> Result<()> {
-    let module = parse_module(
+    let warnings = compile(
         "test.sob",
         r#"
 extern fn printf(ptr, ...) -> i32
@@ -67,8 +69,23 @@ run:
     "#,
     )?;
 
-    let x86 = X86Codegen {};
-    let asm = x86.compile_module(
+    for w in warnings {
+        eprintln!("{:?}", miette::Report::new(w));
+    }
+
+    Ok(())
+}
+
+fn compile(filename: &str, source_code: &str) -> Result<Vec<CompilerDiagnostic>, DiagnosticReport> {
+    let mut ctx = DiagCtx::new(filename, source_code);
+
+    let module = parse_module(source_code, &mut ctx);
+
+    if ctx.has_errors() {
+        return ctx.finish();
+    }
+
+    if let Some(asm) = X86Codegen.compile_module(
         module,
         TargetInfo {
             triple: TargetTriple {
@@ -78,8 +95,10 @@ run:
                 abi: None,
             },
         },
-    )?;
+        &mut ctx,
+    ) {
+        let _ = asm.emit_asm(&mut io::stdout());
+    }
 
-    asm.emit_asm(&mut io::stdout())?;
-    Ok(())
+    ctx.finish()
 }

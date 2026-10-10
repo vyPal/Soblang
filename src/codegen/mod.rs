@@ -2,7 +2,7 @@ use std::io::Write;
 
 use miette::Result;
 
-use crate::ir::IRModule;
+use crate::{diagnostics::DiagCtx, ir::IRModule};
 
 pub mod backends;
 
@@ -24,5 +24,10 @@ pub trait TargetAssembly {
 pub trait CodegenBackend {
     type Assembly: TargetAssembly;
 
-    fn compile_module(&self, module: IRModule, target: TargetInfo) -> Result<Self::Assembly>;
+    fn compile_module(
+        &self,
+        module: IRModule,
+        target: TargetInfo,
+        ctx: &mut DiagCtx,
+    ) -> Option<Self::Assembly>;
 }

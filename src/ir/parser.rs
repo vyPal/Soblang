@@ -1,69 +1,12 @@
-use std::sync::Arc;
+use miette::{Result, SourceSpan};
 
-use miette::{Diagnostic, NamedSource, Result, SourceSpan};
-use thiserror::Error;
-
-use crate::ir::{
-    GlobalInit, ICmpKind, IRBlock, IRExtern, IRFunction, IRGlobal, IRInst, IRInstFlags, IRInstMeta,
-    IRModule, IROp, IRResult, Param, Value, Width,
+use crate::{
+    diagnostics::{Diag, DiagCtx},
+    ir::{
+        GlobalInit, ICmpKind, IRBlock, IRExtern, IRFunction, IRGlobal, IRInst, IRInstFlags,
+        IRInstMeta, IRModule, IROp, IRResult, Param, Value, Width,
+    },
 };
-
-#[derive(Debug, Error, Diagnostic)]
-#[error("failed to parse `{name}`")]
-#[diagnostic(code(ir::parse))]
-pub struct ParseErrors {
-    name: String,
-    #[related]
-    errors: Vec<ParseError>,
-}
-
-#[derive(Debug, Error, Diagnostic)]
-#[error("{message}")]
-pub struct ParseError {
-    message: String,
-    #[source_code]
-    src: NamedSource<Arc<str>>,
-    #[label("{label}")]
-    span: SourceSpan,
-    label: String,
-    #[help]
-    help: Option<String>,
-}
-
-struct PErr {
-    message: String,
-    span: SourceSpan,
-    label: String,
-    help: Option<String>,
-}
-
-impl PErr {
-    fn new(message: impl Into<String>, span: SourceSpan, label: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            span,
-            label: label.into(),
-            help: None,
-        }
-    }
-
-    fn help(mut self, help: impl Into<String>) -> Self {
-        self.help = Some(help.into());
-        self
-    }
-
-    fn into_diag(self, name: &str, src: Arc<str>) -> ParseError {
-        ParseError {
-            message: self.message,
-            src: NamedSource::new(name, src),
-            span: self.span,
-            label: self.label,
-            help: self.help,
-        }
-    }
-}
-
-type PResult<T> = Result<T, PErr>;
 
 #[derive(Debug, Clone, PartialEq)]
 #[rustfmt::skip]
@@ -109,7 +52,7 @@ struct Token {
     span: SourceSpan,
 }
 
-fn lex(src: &str, errs: &mut Vec<PErr>) -> Vec<Token> {
+fn lex(src: &str, errs: &mut DiagCtx) -> Vec<Token> {
     let mut out: Vec<Token> = Vec::new();
     let b = src.as_bytes();
     let push = |out: &mut Vec<Token>, tok: Tok, start: usize, end: usize| {
@@ -187,7 +130,7 @@ fn lex(src: &str, errs: &mut Vec<PErr>) -> Vec<Token> {
                     i += 1;
                 }
                 if i == start + 1 {
-                    errs.push(PErr::new(
+                    errs.emit(Diag::error(
                         "invalid global name",
                         (start, 1).into(),
                         "expected name after `@`",
@@ -208,8 +151,8 @@ fn lex(src: &str, errs: &mut Vec<PErr>) -> Vec<Token> {
                 loop {
                     match b.get(i) {
                         None | Some(b'\n') => {
-                            errs.push(
-                                PErr::new(
+                            errs.emit(
+                                Diag::error(
                                     "unterminated string literal",
                                     (start, i - start).into(),
                                     "string starts here",
@@ -250,8 +193,8 @@ fn lex(src: &str, errs: &mut Vec<PErr>) -> Vec<Token> {
                                     i += 1;
                                 }
                                 None => {
-                                    errs.push(
-                                        PErr::new(
+                                    errs.emit(
+                                        Diag::error(
                                             "unknown escape",
                                             (esc_start, 2).into(),
                                             "unsupported escape sequence",
@@ -281,8 +224,8 @@ fn lex(src: &str, errs: &mut Vec<PErr>) -> Vec<Token> {
                 }
                 match src[start + 1..i].parse::<Value>() {
                     Ok(val) => push(&mut out, Tok::Val(val), start, i),
-                    Err(_) => errs.push(
-                        PErr::new(
+                    Err(_) => errs.emit(
+                        Diag::error(
                             "invalid value",
                             (start, (i - start).max(1)).into(),
                             "expected `%` followed by a number",
@@ -298,7 +241,7 @@ fn lex(src: &str, errs: &mut Vec<PErr>) -> Vec<Token> {
                 }
                 match src[start..i].parse::<i64>() {
                     Ok(val) => push(&mut out, Tok::Int(val), start, i),
-                    Err(_) => errs.push(PErr::new(
+                    Err(_) => errs.emit(Diag::error(
                         "not a valid integer",
                         (start, (i - start).max(1)).into(),
                         "value is not a valid 64-bit integer",
@@ -314,7 +257,7 @@ fn lex(src: &str, errs: &mut Vec<PErr>) -> Vec<Token> {
             }
             _ => {
                 let ch = src[i..].chars().next().unwrap();
-                errs.push(PErr::new(
+                errs.emit(Diag::error(
                     format!("unexpected character `{ch}`"),
                     (i, ch.len_utf8()).into(),
                     "not valid here",
@@ -367,16 +310,16 @@ impl<'t> Parser<'t> {
         matches!(&self.peek().tok, Tok::Ident(k) if s == k)
     }
 
-    fn unexpected(&self, what: &str) -> PErr {
+    fn unexpected(&self, what: &str) -> Diag {
         let t = self.peek();
-        PErr::new(
+        Diag::error(
             format!("expected {what}"),
             t.span,
             format!("found {}", t.tok.describe()),
         )
     }
 
-    fn expect(&mut self, tok: Tok, what: &str) -> PResult<SourceSpan> {
+    fn expect(&mut self, tok: Tok, what: &str) -> Result<SourceSpan, Diag> {
         if self.peek().tok == tok {
             Ok(self.bump().span)
         } else {
@@ -384,14 +327,14 @@ impl<'t> Parser<'t> {
         }
     }
 
-    fn ident(&mut self, what: &str) -> PResult<(String, SourceSpan)> {
+    fn ident(&mut self, what: &str) -> Result<(String, SourceSpan), Diag> {
         match self.peek().tok.clone() {
             Tok::Ident(s) => Ok((s, self.bump().span)),
             _ => Err(self.unexpected(what)),
         }
     }
 
-    fn value(&mut self) -> PResult<Value> {
+    fn value(&mut self) -> Result<Value, Diag> {
         match self.peek().tok {
             Tok::Val(val) => {
                 self.bump();
@@ -401,17 +344,17 @@ impl<'t> Parser<'t> {
         }
     }
 
-    fn int(&mut self, what: &str) -> PResult<(i64, SourceSpan)> {
+    fn int(&mut self, what: &str) -> Result<(i64, SourceSpan), Diag> {
         match self.peek().tok {
             Tok::Int(int) => Ok((int, self.bump().span)),
             _ => Err(self.unexpected(what)),
         }
     }
 
-    fn uint(&mut self, what: &str) -> PResult<u32> {
+    fn uint(&mut self, what: &str) -> Result<u32, Diag> {
         let (i, span) = self.int(what)?;
         u32::try_from(i).map_err(|_| {
-            PErr::new(
+            Diag::error(
                 format!("invalid {what}"),
                 span,
                 "must be a non-negative 32-bit integer",
@@ -419,7 +362,7 @@ impl<'t> Parser<'t> {
         })
     }
 
-    fn ty(&mut self) -> PResult<Width> {
+    fn ty(&mut self) -> Result<Width, Diag> {
         let (name, span) = self.ident("a type")?;
         if name == "ptr" {
             return Ok(Width::Ptr);
@@ -429,7 +372,7 @@ impl<'t> Parser<'t> {
             .filter(|&n| n > 0)
             .map(Width::Width)
             .ok_or_else(|| {
-                PErr::new(format!("unknown type {name}"), span, "not a type")
+                Diag::error(format!("unknown type {name}"), span, "not a type")
                     .help("types are `ptr` or `iN`, e.g. `i32`")
             })
     }
@@ -438,7 +381,7 @@ impl<'t> Parser<'t> {
         while self.eat(Tok::Newline) {}
     }
 
-    fn end_of_line(&mut self) -> PResult<()> {
+    fn end_of_line(&mut self) -> Result<(), Diag> {
         match self.peek().tok {
             Tok::Newline => {
                 self.bump();
@@ -463,17 +406,19 @@ impl<'t> Parser<'t> {
         self.eat(Tok::RBrace);
     }
 
-    fn inst(&mut self) -> PResult<IRInst> {
+    fn inst(&mut self) -> Result<IRInst, Diag> {
         let start = self.peek().span.offset();
 
         let result = if let Tok::Val(_) = self.peek().tok {
             let value = self.value()?;
             self.expect(Tok::Colon, "`:` after the result value")?;
+            let ty_span = self.peek().span;
             let ty = self.ty()?;
             self.expect(Tok::Eq, "`=`")?;
             Some(IRResult {
                 id: value,
                 width: ty,
+                span: Some(ty_span),
             })
         } else {
             None
@@ -518,7 +463,7 @@ impl<'t> Parser<'t> {
                 "icmp" => {
                     let (k, kspan) = self.ident("a icmp kind")?;
                     let kind = k.parse::<ICmpKind>().map_err(|_| {
-                        PErr::new(
+                        Diag::error(
                             format!("unknown comparison kind `{k}`"),
                             kspan,
                             "not a comparison kind",
@@ -581,7 +526,7 @@ impl<'t> Parser<'t> {
                     IROp::Store(p, o, self.value()?)
                 }
                 _ => {
-                    return Err(PErr::new(
+                    return Err(Diag::error(
                         format!("unknown instruction {m}"),
                         mspan,
                         "unknown mnemonic",
@@ -603,7 +548,7 @@ impl<'t> Parser<'t> {
         })
     }
 
-    fn function(&mut self, errs: &mut Vec<PErr>) -> PResult<IRFunction> {
+    fn function(&mut self, errs: &mut DiagCtx) -> Result<IRFunction, Diag> {
         self.bump();
         let (name, name_span) = self.ident("a function name")?;
         self.expect(Tok::LParen, "`(`")?;
@@ -612,8 +557,13 @@ impl<'t> Parser<'t> {
             loop {
                 let id = self.value()?;
                 self.expect(Tok::Colon, "`:`")?;
+                let start = self.pos;
                 let ty = self.ty()?;
-                params.push(Param { id, width: ty });
+                params.push(Param {
+                    id,
+                    width: ty,
+                    span: Some((start, self.pos - start).into()),
+                });
                 if self.eat(Tok::RParen) {
                     break;
                 }
@@ -637,7 +587,7 @@ impl<'t> Parser<'t> {
                     break;
                 }
                 Tok::Eof => {
-                    return Err(PErr::new(
+                    return Err(Diag::error(
                         "unterminated function",
                         name_span,
                         "this function is never closed",
@@ -652,7 +602,7 @@ impl<'t> Parser<'t> {
                         instructions: vec![],
                     });
                     if let Err(e) = self.end_of_line() {
-                        errs.push(e);
+                        errs.emit(e);
                         self.recover_line();
                     }
                 }
@@ -662,8 +612,8 @@ impl<'t> Parser<'t> {
                         Ok(inst) => match blocks.last_mut() {
                             Some(b) => b.instructions.push(inst),
                             None => {
-                                errs.push(
-                                    PErr::new(
+                                errs.emit(
+                                    Diag::error(
                                         "instruction outside of a block",
                                         inst.meta.span.unwrap(),
                                         "no label before this",
@@ -673,7 +623,7 @@ impl<'t> Parser<'t> {
                             }
                         },
                         Err(e) => {
-                            errs.push(e);
+                            errs.emit(e);
                             self.recover_line();
                         }
                     }
@@ -689,7 +639,7 @@ impl<'t> Parser<'t> {
         })
     }
 
-    fn extern_decl(&mut self) -> PResult<IRExtern> {
+    fn extern_decl(&mut self) -> Result<IRExtern, Diag> {
         self.bump();
         if !self.kw("fn") {
             return Err(self.unexpected("`fn`"));
@@ -729,7 +679,7 @@ impl<'t> Parser<'t> {
         })
     }
 
-    fn global_decl(&mut self) -> PResult<IRGlobal> {
+    fn global_decl(&mut self) -> Result<IRGlobal, Diag> {
         self.bump();
         let (mut export, mut mutable) = (false, false);
         loop {
@@ -773,7 +723,7 @@ impl<'t> Parser<'t> {
                             .ok()
                             .or_else(|| i8::try_from(n).ok().map(|v| v as u8))
                             .ok_or_else(|| {
-                                PErr::new("byte out of range", span, "must be in -128..=255")
+                                Diag::error("byte out of range", span, "must be in -128..=255")
                             })?;
                         bytes.push(byte);
                         if self.eat(Tok::RBracket) {
@@ -802,7 +752,7 @@ impl<'t> Parser<'t> {
         })
     }
 
-    fn module(&mut self, errs: &mut Vec<PErr>) -> IRModule {
+    fn module(&mut self, errs: &mut DiagCtx) -> IRModule {
         let mut functions = Vec::new();
         let mut externs = Vec::new();
         let mut globals = Vec::new();
@@ -813,28 +763,28 @@ impl<'t> Parser<'t> {
                 Tok::Ident(k) if k == "fn" => match self.function(errs) {
                     Ok(func) => functions.push(func),
                     Err(e) => {
-                        errs.push(e);
+                        errs.emit(e);
                         self.recover_block();
                     }
                 },
                 Tok::Ident(k) if k == "extern" => match self.extern_decl() {
                     Ok(ext) => externs.push(ext),
                     Err(e) => {
-                        errs.push(e);
+                        errs.emit(e);
                         self.recover_line();
                     }
                 },
                 Tok::Ident(k) if k == "global" => match self.global_decl() {
                     Ok(glob) => globals.push(glob),
                     Err(e) => {
-                        errs.push(e);
+                        errs.emit(e);
                         self.recover_line();
                     }
                 },
                 _ => {
                     let t = self.bump();
-                    errs.push(
-                        PErr::new("expected fn", t.span, "not a function definition")
+                    errs.emit(
+                        Diag::error("expected fn", t.span, "not a function definition")
                             .help("only function definitions are allowed at the top level"),
                     );
                     self.recover_block();
@@ -855,7 +805,7 @@ fn check_result_shape(
     result: &Option<IRResult>,
     m: &str,
     span: SourceSpan,
-) -> PResult<()> {
+) -> Result<(), Diag> {
     let produces = match op {
         IROp::Jmp(_) | IROp::Br(..) | IROp::Ret(_) | IROp::Store(..) => Some(false),
         IROp::Call(..) => None,
@@ -864,11 +814,11 @@ fn check_result_shape(
     match (produces, result.is_some()) {
         (Some(true), false) => {
             Err(
-                PErr::new(format!("`{m}` produces a value"), span, "result is missing")
+                Diag::error(format!("`{m}` produces a value"), span, "result is missing")
                     .help(format!("write it as `%N: <type> = {m} ...`")),
             )
         }
-        (Some(false), true) => Err(PErr::new(
+        (Some(false), true) => Err(Diag::error(
             format!("`{m}` does not produce a value"),
             span,
             "cannot be assigned",
@@ -878,26 +828,12 @@ fn check_result_shape(
     }
 }
 
-pub fn parse_module(name: &str, src: &str) -> Result<IRModule, ParseErrors> {
-    let mut errs = Vec::new();
-    let toks = lex(src, &mut errs);
+pub fn parse_module(src: &str, ctx: &mut DiagCtx) -> IRModule {
+    let toks = lex(src, ctx);
     let mut p = Parser {
         toks: &toks,
         pos: 0,
         last_end: 0,
     };
-    let module = p.module(&mut errs);
-
-    if errs.is_empty() {
-        return Ok(module);
-    }
-
-    let source: Arc<str> = Arc::from(src);
-    Err(ParseErrors {
-        name: name.to_string(),
-        errors: errs
-            .into_iter()
-            .map(|e| e.into_diag(name, source.clone()))
-            .collect(),
-    })
+    p.module(ctx)
 }

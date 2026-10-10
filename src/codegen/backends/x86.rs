@@ -6,13 +6,14 @@ use std::{
     vec,
 };
 
-use miette::{IntoDiagnostic, Result, bail};
+use miette::{IntoDiagnostic, Result, SourceSpan};
 
 use crate::{
     codegen::{
         CodegenBackend, TargetAssembly, TargetInfo,
         backends::x86::Reg::{Physical, Virtual},
     },
+    diagnostics::{Diag, DiagCtx},
     ir::{self, GlobalInit, ICmpKind, IRFunction, IRGlobal, IRInst, IRModule, IROp, Param, Value},
 };
 
@@ -80,7 +81,12 @@ pub struct X86Codegen;
 impl CodegenBackend for X86Codegen {
     type Assembly = X86Assembly;
 
-    fn compile_module(&self, module: IRModule, target: TargetInfo) -> Result<Self::Assembly> {
+    fn compile_module(
+        &self,
+        module: IRModule,
+        target: TargetInfo,
+        ctx: &mut DiagCtx,
+    ) -> Option<Self::Assembly> {
         let features = X86Features::from_target_info(target);
         let mut insts = Vec::new();
         let mut exports = Vec::new();
@@ -106,11 +112,17 @@ impl CodegenBackend for X86Codegen {
         }
 
         for f in module.functions {
-            insts.extend(self.compile_function(&f, &features, callees.clone())?);
-            exports.push(f.name);
+            if let Some(mut f_insts) = self.compile_function(&f, &features, callees.clone(), ctx) {
+                insts.append(&mut f_insts);
+                exports.push(f.name);
+            }
         }
 
-        Ok(X86Assembly {
+        if ctx.has_errors() {
+            return None;
+        }
+
+        Some(X86Assembly {
             insts,
             exports,
             externs: module.externs.iter().map(|e| e.name.clone()).collect(),
@@ -126,10 +138,14 @@ impl X86Codegen {
         function: &IRFunction,
         feat: &X86Features,
         callees: HashMap<String, CalleeInfo>,
-    ) -> Result<Vec<X86Instruction>> {
+        diag: &mut DiagCtx,
+    ) -> Option<Vec<X86Instruction>> {
         let mut value_widths = HashMap::new();
         for param in &function.params {
-            value_widths.insert(param.id, Width::from_bit_width(param.width, feat)?);
+            value_widths.insert(
+                param.id,
+                Width::from_bit_width(param.width, feat, param.span, diag)?,
+            );
         }
         let mut consts = HashMap::new();
         for b in function.blocks.iter() {
@@ -138,7 +154,10 @@ impl X86Codegen {
                     consts.insert(res.id, *c);
                 }
                 if let Some(ref res) = inst.meta.result {
-                    value_widths.insert(res.id, Width::from_bit_width(res.width, feat)?);
+                    value_widths.insert(
+                        res.id,
+                        Width::from_bit_width(res.width, feat, res.span, diag)?,
+                    );
                 }
             }
         }
@@ -164,15 +183,20 @@ impl X86Codegen {
             )));
             let mut i = 0;
             while i < b.instructions.len() {
-                if self.lower_inst(
+                if let Some(res) = self.lower_inst(
                     &b.instructions[i],
                     b.instructions.get(i + 1),
                     &mut asm,
                     &uses,
                     feat,
                     &ctx,
-                )? {
-                    i += 2;
+                    diag,
+                ) {
+                    if res {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
                 } else {
                     i += 1;
                 }
@@ -242,9 +266,11 @@ impl X86Codegen {
         insts.push(X86Instruction::Ret);
 
         let insts = self.resolve_frame(insts, &frame, feat);
-        Ok(self.cleanup_control_flow(insts, &function.name))
+        Some(self.cleanup_control_flow(insts, &function.name))
     }
 
+    // BUG: FIX
+    #[allow(clippy::too_many_arguments)]
     pub fn lower_inst(
         &self,
         inst: &IRInst,
@@ -253,9 +279,13 @@ impl X86Codegen {
         uses: &HashMap<Value, usize>,
         feat: &X86Features,
         ctx: &FunctionContext,
-    ) -> Result<bool> {
+        diag: &mut DiagCtx,
+    ) -> Option<bool> {
         let (dst_value, width) = match &inst.meta.result {
-            Some(res) => (res.id, Width::from_bit_width(res.width, feat)?),
+            Some(res) => (
+                res.id,
+                Width::from_bit_width(res.width, feat, res.span, diag)?,
+            ),
             None => (0, Width::W0),
         };
         let dst = Operand::Reg(Reg::Virtual(dst_value, width));
@@ -321,7 +351,14 @@ impl X86Codegen {
                     Width::W16 => asm.push(X86Instruction::Cwd),
                     Width::W32 => asm.push(X86Instruction::Cdq),
                     Width::W64 => asm.push(X86Instruction::Cqo),
-                    _ => bail!("Unsupported divison width: {width:?}"),
+                    _ => {
+                        diag.emit(Diag::error(
+                            "unsupported division width: {width:?}",
+                            inst.meta.span.unwrap_or_else(|| (0, 0).into()),
+                            "cannot lower this division operation for x86",
+                        ));
+                        return None;
+                    }
                 }
 
                 asm.push(X86Instruction::IDiv(Operand::Reg(Virtual(src2, width))));
@@ -443,7 +480,7 @@ impl X86Codegen {
                 {
                     asm.push(X86Instruction::Jcc(cc, format!("{}.{t}", ctx.func_name)));
                     asm.push(X86Instruction::Jmp(format!("{}.{f}", ctx.func_name)));
-                    return Ok(true);
+                    return Some(true);
                 } else {
                     asm.push(X86Instruction::SetCC(
                         cc,
@@ -586,7 +623,7 @@ impl X86Codegen {
             }
         }
 
-        Ok(false)
+        Some(false)
     }
 }
 
@@ -1289,7 +1326,7 @@ impl X86Codegen {
         &self,
         asm: &[X86Instruction],
         params: &[Param],
-    ) -> Result<Vec<LiveInterval>> {
+    ) -> Option<Vec<LiveInterval>> {
         let mut virt: HashMap<Value, LiveInterval> = HashMap::new();
         let mut phys_open: HashMap<PhysReg, LiveInterval> = HashMap::new();
         let mut finished: Vec<LiveInterval> = Vec::new();
@@ -1355,7 +1392,7 @@ impl X86Codegen {
 
         finished.extend(virt.into_values());
         finished.sort_by_key(|i| i.start);
-        Ok(finished)
+        Some(finished)
     }
 
     fn extend_for_liveness(&self, asm: &[X86Instruction], virt: &mut HashMap<Value, LiveInterval>) {
@@ -1454,7 +1491,7 @@ impl X86Codegen {
         hints: HashMap<Value, PhysReg>,
         copy_hints: HashMap<Value, Vec<Value>>,
         feat: &X86Features,
-    ) -> Result<(HashMap<Value, RegAllocation>, u32)> {
+    ) -> Option<(HashMap<Value, RegAllocation>, u32)> {
         let allocatable = feat.get_allocatable_registers();
         let (phys, virt): (Vec<_>, Vec<_>) = intervals
             .into_iter()
@@ -1527,7 +1564,7 @@ impl X86Codegen {
             }
         }
 
-        Ok((allocations, next_slot))
+        Some((allocations, next_slot))
     }
 
     fn apply_allocations(
@@ -1904,8 +1941,13 @@ pub enum Width {
 }
 
 impl Width {
-    pub fn from_bit_width(width: ir::Width, feat: &X86Features) -> Result<Self> {
-        Ok(match width {
+    pub fn from_bit_width(
+        width: ir::Width,
+        feat: &X86Features,
+        span: Option<SourceSpan>,
+        ctx: &mut DiagCtx,
+    ) -> Option<Self> {
+        Some(match width {
             ir::Width::Width(w) => match w {
                 0 => Self::W0,
                 8 => Self::W8,
@@ -1915,7 +1957,14 @@ impl Width {
                 128 if feat.avx1 => Self::W128,
                 256 if feat.avx1 => Self::W256,
                 512 if feat.avx512 => Self::W512,
-                _ => bail!("{} does not support a bit width of {w}", feat.arch),
+                _ => {
+                    ctx.emit(Diag::error(
+                        format!("{} does not support a bit width of {w}", feat.arch),
+                        span.unwrap_or_else(|| (0, 0).into()),
+                        "unsupported bit width",
+                    ));
+                    return None;
+                }
             },
             ir::Width::Ptr => feat.max_width(),
         })

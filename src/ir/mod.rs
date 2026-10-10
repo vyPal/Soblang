@@ -50,6 +50,7 @@ pub struct IRFunction {
 pub struct Param {
     pub id: Value,
     pub width: Width,
+    pub span: Option<SourceSpan>,
 }
 pub type IRResult = Param;
 
